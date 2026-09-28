@@ -1,0 +1,8 @@
+streamlit
+numpy
+pandas
+pillow
+dlib-bin
+face_recognition
+face_recognition_models
+setuptools
