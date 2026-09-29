@@ -1,7 +1,0 @@
-streamlit
-numpy
-pandas
-pillow
-face_recognition
-face_recognition_models
-setuptools
