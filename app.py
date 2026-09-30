@@ -32,34 +32,73 @@ def detect_faces(gray_img):
     return face_cascade.detectMultiScale(gray_img, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
 
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+
+def _face_crop_from_file(path):
+    """Load an image file and return its largest detected face, resized, or None."""
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    boxes = detect_faces(gray)
+    if len(boxes) == 0:
+        return None
+    x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])  # largest face in photo
+    return cv2.resize(gray[y:y + h, x:x + w], (200, 200))
+
+
+def _strip_extensions(fname):
+    """Strip one or more trailing image extensions, e.g. 'Name.jpg.webp' -> 'Name'."""
+    stem = fname
+    while os.path.splitext(stem)[1].lower() in IMAGE_EXTS:
+        stem = os.path.splitext(stem)[0]
+    return stem
+
+
+def _clean_name(stem):
+    """Turn a filename stem like 'Shiva_Kumar' into a display name 'Shiva Kumar'."""
+    return stem.replace("_", " ").replace("-", " ").strip()
+
+
 @st.cache_resource(show_spinner="Training on known faces...")
 def train_recognizer():
-    """Read known_faces/<Name>/*.jpg, detect the face crop in each, and fit LBPH."""
+    """
+    Build the training set from known_faces/, supporting two layouts:
+    - known_faces/<Name>/photo1.jpg, photo2.jpg  (folder per person, multiple photos)
+    - known_faces/<Name>.jpg                     (one flat file per person)
+    Both can be mixed in the same folder.
+    """
     faces, labels, names = [], [], []
     if not os.path.isdir(KNOWN_DIR):
         return None, []
 
-    for person in sorted(os.listdir(KNOWN_DIR)):
-        person_dir = os.path.join(KNOWN_DIR, person)
-        if not os.path.isdir(person_dir):
-            continue
-        label_id = len(names)
-        found_any = False
-        for fname in os.listdir(person_dir):
-            path = os.path.join(person_dir, fname)
-            img = cv2.imread(path)
-            if img is None:
+    for entry in sorted(os.listdir(KNOWN_DIR)):
+        entry_path = os.path.join(KNOWN_DIR, entry)
+
+        if os.path.isdir(entry_path):
+            label_id = len(names)
+            found_any = False
+            for fname in os.listdir(entry_path):
+                if not fname.lower().endswith(IMAGE_EXTS):
+                    continue
+                crop = _face_crop_from_file(os.path.join(entry_path, fname))
+                if crop is None:
+                    continue
+                faces.append(crop)
+                labels.append(label_id)
+                found_any = True
+            if found_any:
+                names.append(_clean_name(entry))
+
+        elif entry.lower().endswith(IMAGE_EXTS):
+            stem = _strip_extensions(entry)
+            crop = _face_crop_from_file(entry_path)
+            if crop is None:
                 continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            boxes = detect_faces(gray)
-            if len(boxes) == 0:
-                continue
-            x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])  # largest face in photo
-            faces.append(cv2.resize(gray[y:y + h, x:x + w], (200, 200)))
-            labels.append(label_id)
-            found_any = True
-        if found_any:
-            names.append(person)
+            faces.append(crop)
+            labels.append(len(names))
+            names.append(_clean_name(stem))
 
     if not faces:
         return None, []
@@ -91,7 +130,7 @@ with st.sidebar:
         st.warning(f"No known faces found. Add photos under `{KNOWN_DIR}/<PersonName>/`.")
     st.caption("One clear, front-facing photo per person is enough. More photos improve accuracy.")
 
-uploaded = st.file_uploader("Upload a photo to take attendance", type=["jpg", "jpeg", "png"])
+uploaded = st.camera_input("Take a photo to mark attendance")
 
 if uploaded and recognizer is not None:
     img = np.array(Image.open(uploaded).convert("RGB"))
@@ -127,6 +166,8 @@ if uploaded and recognizer is not None:
 elif uploaded:
     st.error("No known faces to compare against yet — add photos to known_faces/ first.")
 
+st.caption("Camera access needs to be allowed in your browser. On a phone, this opens your camera app.")
+
 st.divider()
 st.subheader("Attendance log")
 if os.path.exists(ATTENDANCE_FILE):
@@ -135,3 +176,4 @@ if os.path.exists(ATTENDANCE_FILE):
     st.download_button("Download CSV", log.to_csv(index=False), "attendance.csv")
 else:
     st.caption("No attendance marked yet.")
+
