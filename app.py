@@ -1,13 +1,3 @@
-"""
-Smart Attendance — face recognition with OpenCV only (no dlib, no compiling).
-
-How it works:
-1. Known faces live in known_faces/<PersonName>/*.jpg (one or more photos per person).
-2. On startup we detect faces in those photos (Haar cascade) and train an
-   LBPH recognizer (cv2.face.LBPHFaceRecognizer) to tell people apart.
-3. Upload a new photo -> we detect faces in it and ask the recognizer who each one is.
-4. Recognized people get marked present in attendance.csv (once per day).
-"""
 import os
 import datetime as dt
 
@@ -24,7 +14,15 @@ CONFIDENCE_THRESHOLD = 70  # LBPH distance: LOWER = more confident. Tune this.
 st.set_page_config(page_title="Smart Attendance", page_icon="🧑‍💼")
 st.title("🧑‍💼 Smart Attendance")
 
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+_LOCAL_CASCADE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "haarcascade_frontalface_default.xml")
+_cascade_path = _LOCAL_CASCADE if os.path.exists(_LOCAL_CASCADE) else cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+face_cascade = cv2.CascadeClassifier(_cascade_path)
+if face_cascade.empty():
+    st.error(
+        "Could not load the face-detection model file. Make sure "
+        "'haarcascade_frontalface_default.xml' is in the same folder as app.py."
+    )
+    st.stop()
 
 
 def detect_faces(gray_img):
@@ -176,4 +174,3 @@ if os.path.exists(ATTENDANCE_FILE):
     st.download_button("Download CSV", log.to_csv(index=False), "attendance.csv")
 else:
     st.caption("No attendance marked yet.")
-
