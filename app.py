@@ -1,18 +1,23 @@
 import os
+import shutil
+import time
 import datetime as dt
 
+import av
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
+ENROLLED_DIR = "enrolled_faces"
 ATTENDANCE_FILE = "attendance.csv"
 CONFIDENCE_THRESHOLD = 70  # LBPH distance: LOWER = more confident. Tune this.
 
 st.set_page_config(page_title="Smart Attendance", page_icon="🧑‍💼")
 st.title("🧑‍💼 Smart Attendance")
-st.caption("Enroll people with your camera, then scan to take attendance. No files to upload.")
+st.caption("Enroll people with your camera, then scan to take attendance. No manual file uploads.")
 
 _LOCAL_CASCADE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "haarcascade_frontalface_default.xml")
 _cascade_path = _LOCAL_CASCADE if os.path.exists(_LOCAL_CASCADE) else cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -35,25 +40,57 @@ def largest_face_crop(bgr_img):
     gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
     boxes = detect_faces(gray)
     if len(boxes) == 0:
-        return None, []
+        return None
     x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
-    return cv2.resize(gray[y:y + h, x:x + w], (200, 200)), boxes
+    return cv2.resize(gray[y:y + h, x:x + w], (200, 200))
 
 
-if "people" not in st.session_state:
-    st.session_state.people = {}  # name -> list of 200x200 grayscale face crops
+def _dir_signature(d):
+    """A cheap fingerprint of a folder's contents, so the cache below knows when to retrain."""
+    if not os.path.isdir(d):
+        return ""
+    parts = []
+    for root, _, files in os.walk(d):
+        for f in files:
+            p = os.path.join(root, f)
+            parts.append(f"{p}:{os.path.getmtime(p)}")
+    return "|".join(sorted(parts))
 
 
-def train_recognizer():
-    """Fit LBPH on everyone currently enrolled this session. None if nobody enrolled."""
-    names = list(st.session_state.people.keys())
-    if not names:
+@st.cache_resource(show_spinner="Training on enrolled faces...")
+def train_recognizer(signature):
+    """
+    Scan enrolled_faces/<Name>/*.jpg and fit LBPH.
+    'signature' is unused inside but forces Streamlit to retrain whenever the
+    folder changes (new enrollment), while reusing the cached model otherwise —
+    this cache is shared by every visitor to the app.
+    """
+    faces, labels, names = [], [], []
+    if not os.path.isdir(ENROLLED_DIR):
         return None, []
-    faces, labels = [], []
-    for label_id, name in enumerate(names):
-        for crop in st.session_state.people[name]:
+
+    for person in sorted(os.listdir(ENROLLED_DIR)):
+        person_dir = os.path.join(ENROLLED_DIR, person)
+        if not os.path.isdir(person_dir):
+            continue
+        label_id = len(names)
+        found_any = False
+        for fname in os.listdir(person_dir):
+            img = cv2.imread(os.path.join(person_dir, fname))
+            if img is None:
+                continue
+            crop = largest_face_crop(img)
+            if crop is None:
+                continue
             faces.append(crop)
             labels.append(label_id)
+            found_any = True
+        if found_any:
+            names.append(person)
+
+    if not faces:
+        return None, []
+
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.train(faces, np.array(labels))
     return recognizer, names
@@ -68,15 +105,19 @@ def mark_present(name):
     if not already:
         df = pd.concat([df, pd.DataFrame([[name, today, now]], columns=cols)], ignore_index=True)
         df.to_csv(ATTENDANCE_FILE, index=False)
-    return already
+    return bool(already)
 
 
 # ---------- Sidebar: enroll people ----------
 with st.sidebar:
     st.subheader("Enrolled people")
-    if st.session_state.people:
-        for name in st.session_state.people:
-            st.write(f"• {name} ({len(st.session_state.people[name])} photo(s))")
+    enrolled_now = sorted(
+        p for p in os.listdir(ENROLLED_DIR) if os.path.isdir(os.path.join(ENROLLED_DIR, p))
+    ) if os.path.isdir(ENROLLED_DIR) else []
+    if enrolled_now:
+        for person in enrolled_now:
+            n = len(os.listdir(os.path.join(ENROLLED_DIR, person)))
+            st.write(f"• {person} ({n} photo(s))")
     else:
         st.info("Nobody enrolled yet. Add someone below.")
 
@@ -91,60 +132,76 @@ with st.sidebar:
         else:
             img = np.array(Image.open(new_photo).convert("RGB"))
             bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            crop, _ = largest_face_crop(bgr)
-            if crop is None:
+            if largest_face_crop(bgr) is None:
                 st.error("No face detected in that photo — try again with better lighting.")
             else:
-                st.session_state.people.setdefault(safe_name, []).append(crop)
-                st.success(f"Enrolled {safe_name}.")
+                person_dir = os.path.join(ENROLLED_DIR, safe_name)
+                os.makedirs(person_dir, exist_ok=True)
+                cv2.imwrite(os.path.join(person_dir, f"{int(time.time() * 1000)}.jpg"), bgr)
+                st.success(f"Enrolled {safe_name}. Saved to disk.")
                 st.rerun()
 
-    if st.session_state.people:
+    if enrolled_now:
         st.divider()
-        who = st.selectbox("Remove someone", [""] + list(st.session_state.people.keys()))
+        who = st.selectbox("Remove someone", [""] + enrolled_now)
         if who and st.button(f"Remove {who}"):
-            del st.session_state.people[who]
+            shutil.rmtree(os.path.join(ENROLLED_DIR, who), ignore_errors=True)
             st.rerun()
 
-    st.caption("⚠️ Enrolled people are remembered only for this browser session — "
-               "refreshing the page or reopening the app later starts empty.")
+    st.caption("Enrolled people are saved to the app's disk and survive page refreshes. "
+               "They reset only if the app itself restarts or redeploys.")
 
-# ---------- Main: scan for attendance ----------
-recognizer, known_names = train_recognizer()
-scan_photo = st.camera_input("Scan a face to mark attendance")
+# ---------- Main: live camera recognition ----------
+recognizer, known_names = train_recognizer(_dir_signature(ENROLLED_DIR))
 
-if scan_photo:
-    if recognizer is None:
-        st.error("Nobody is enrolled yet — add people in the sidebar first.")
-    else:
-        img = np.array(Image.open(scan_photo).convert("RGB"))
-        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        boxes = detect_faces(gray)
+if recognizer is None:
+    st.info("Nobody is enrolled yet — add people in the sidebar first, then the live camera will appear here.")
+else:
+    st.subheader("Live attendance camera")
+    st.caption("Allow camera access below. Recognized faces are boxed in green and marked present automatically.")
 
-        if len(boxes) == 0:
-            st.warning("No faces detected in this photo.")
-        else:
-            marked = []
+    class FaceRecognitionProcessor(VideoProcessorBase):
+        def __init__(self):
+            self.recognizer = recognizer
+            self.known_names = known_names
+            self._last_marked = {}  # name -> unix time, avoids hammering the CSV every frame
+
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            boxes = detect_faces(gray)
+
             for (x, y, w, h) in boxes:
-                face_crop = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
-                label_id, distance = recognizer.predict(face_crop)
+                crop = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
+                label_id, distance = self.recognizer.predict(crop)
                 if distance <= CONFIDENCE_THRESHOLD:
-                    name, color = known_names[label_id], (0, 200, 0)
+                    name, color = self.known_names[label_id], (0, 200, 0)
                 else:
                     name, color = "Unknown", (0, 0, 255)
-                cv2.rectangle(bgr, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(bgr, name, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                if name != "Unknown":
-                    already = mark_present(name)
-                    marked.append(f"{name} ({'already marked today' if already else 'marked present'})")
 
-            st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption="Detected faces")
-            if marked:
-                for m in marked:
-                    st.success(m)
-            else:
-                st.info("Faces detected, but none matched an enrolled person.")
+                cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(img, name, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+                if name != "Unknown":
+                    now = time.time()
+                    if now - self._last_marked.get(name, 0) > 5:  # re-check at most every 5s per person
+                        mark_present(name)
+                        self._last_marked[name] = now
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    webrtc_streamer(
+        key="attendance-live",
+        video_processor_factory=FaceRecognitionProcessor,
+        rtc_configuration=RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        ),
+        media_stream_constraints={"video": True, "audio": False},
+    )
+    st.caption(
+        "If the camera preview doesn't connect, your network may be blocking WebRTC "
+        "(common on some corporate/school Wi-Fi). Try a different network or a mobile hotspot."
+    )
 
 st.divider()
 st.subheader("Attendance log")
