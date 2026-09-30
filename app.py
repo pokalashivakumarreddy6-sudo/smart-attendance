@@ -7,12 +7,12 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-KNOWN_DIR = "known_faces"
 ATTENDANCE_FILE = "attendance.csv"
 CONFIDENCE_THRESHOLD = 70  # LBPH distance: LOWER = more confident. Tune this.
 
 st.set_page_config(page_title="Smart Attendance", page_icon="🧑‍💼")
 st.title("🧑‍💼 Smart Attendance")
+st.caption("Enroll people with your camera, then scan to take attendance. No files to upload.")
 
 _LOCAL_CASCADE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "haarcascade_frontalface_default.xml")
 _cascade_path = _LOCAL_CASCADE if os.path.exists(_LOCAL_CASCADE) else cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -30,77 +30,30 @@ def detect_faces(gray_img):
     return face_cascade.detectMultiScale(gray_img, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
 
-IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
-
-
-def _face_crop_from_file(path):
-    """Load an image file and return its largest detected face, resized, or None."""
-    img = cv2.imread(path)
-    if img is None:
-        return None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def largest_face_crop(bgr_img):
+    """Return the largest detected face as a 200x200 grayscale crop, or None."""
+    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
     boxes = detect_faces(gray)
     if len(boxes) == 0:
-        return None
-    x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])  # largest face in photo
-    return cv2.resize(gray[y:y + h, x:x + w], (200, 200))
+        return None, []
+    x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
+    return cv2.resize(gray[y:y + h, x:x + w], (200, 200)), boxes
 
 
-def _strip_extensions(fname):
-    """Strip one or more trailing image extensions, e.g. 'Name.jpg.webp' -> 'Name'."""
-    stem = fname
-    while os.path.splitext(stem)[1].lower() in IMAGE_EXTS:
-        stem = os.path.splitext(stem)[0]
-    return stem
+if "people" not in st.session_state:
+    st.session_state.people = {}  # name -> list of 200x200 grayscale face crops
 
 
-def _clean_name(stem):
-    """Turn a filename stem like 'Shiva_Kumar' into a display name 'Shiva Kumar'."""
-    return stem.replace("_", " ").replace("-", " ").strip()
-
-
-@st.cache_resource(show_spinner="Training on known faces...")
 def train_recognizer():
-    """
-    Build the training set from known_faces/, supporting two layouts:
-    - known_faces/<Name>/photo1.jpg, photo2.jpg  (folder per person, multiple photos)
-    - known_faces/<Name>.jpg                     (one flat file per person)
-    Both can be mixed in the same folder.
-    """
-    faces, labels, names = [], [], []
-    if not os.path.isdir(KNOWN_DIR):
+    """Fit LBPH on everyone currently enrolled this session. None if nobody enrolled."""
+    names = list(st.session_state.people.keys())
+    if not names:
         return None, []
-
-    for entry in sorted(os.listdir(KNOWN_DIR)):
-        entry_path = os.path.join(KNOWN_DIR, entry)
-
-        if os.path.isdir(entry_path):
-            label_id = len(names)
-            found_any = False
-            for fname in os.listdir(entry_path):
-                if not fname.lower().endswith(IMAGE_EXTS):
-                    continue
-                crop = _face_crop_from_file(os.path.join(entry_path, fname))
-                if crop is None:
-                    continue
-                faces.append(crop)
-                labels.append(label_id)
-                found_any = True
-            if found_any:
-                names.append(_clean_name(entry))
-
-        elif entry.lower().endswith(IMAGE_EXTS):
-            stem = _strip_extensions(entry)
-            crop = _face_crop_from_file(entry_path)
-            if crop is None:
-                continue
+    faces, labels = [], []
+    for label_id, name in enumerate(names):
+        for crop in st.session_state.people[name]:
             faces.append(crop)
-            labels.append(len(names))
-            names.append(_clean_name(stem))
-
-    if not faces:
-        return None, []
-
+            labels.append(label_id)
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.train(faces, np.array(labels))
     return recognizer, names
@@ -118,53 +71,80 @@ def mark_present(name):
     return already
 
 
-recognizer, known_names = train_recognizer()
-
+# ---------- Sidebar: enroll people ----------
 with st.sidebar:
-    st.subheader("Known people")
-    if known_names:
-        st.write(", ".join(known_names))
+    st.subheader("Enrolled people")
+    if st.session_state.people:
+        for name in st.session_state.people:
+            st.write(f"• {name} ({len(st.session_state.people[name])} photo(s))")
     else:
-        st.warning(f"No known faces found. Add photos under `{KNOWN_DIR}/<PersonName>/`.")
-    st.caption("One clear, front-facing photo per person is enough. More photos improve accuracy.")
+        st.info("Nobody enrolled yet. Add someone below.")
 
-uploaded = st.camera_input("Take a photo to mark attendance")
-
-if uploaded and recognizer is not None:
-    img = np.array(Image.open(uploaded).convert("RGB"))
-    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    boxes = detect_faces(gray)
-
-    if len(boxes) == 0:
-        st.warning("No faces detected in this photo.")
-    else:
-        marked = []
-        for (x, y, w, h) in boxes:
-            face_crop = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
-            label_id, distance = recognizer.predict(face_crop)
-            if distance <= CONFIDENCE_THRESHOLD:
-                name = known_names[label_id]
-                color = (0, 200, 0)
-            else:
-                name = "Unknown"
-                color = (0, 0, 255)
-            cv2.rectangle(bgr, (x, y), (x + w, y + h), color, 2)
-            cv2.putText(bgr, name, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            if name != "Unknown":
-                already = mark_present(name)
-                marked.append(f"{name} ({'already marked today' if already else 'marked present'})")
-
-        st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption="Detected faces")
-        if marked:
-            for m in marked:
-                st.success(m)
+    st.divider()
+    st.subheader("➕ Enroll a new person")
+    new_name = st.text_input("Name")
+    new_photo = st.camera_input("Take their photo", key="enroll_cam")
+    if st.button("Enroll", disabled=not (new_name and new_photo)):
+        safe_name = "".join(c for c in new_name.strip() if c.isalnum() or c in (" ", "_", "-")).strip()
+        if not safe_name:
+            st.error("Please enter a valid name.")
         else:
-            st.info("Faces detected, but none matched a known person.")
-elif uploaded:
-    st.error("No known faces to compare against yet — add photos to known_faces/ first.")
+            img = np.array(Image.open(new_photo).convert("RGB"))
+            bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            crop, _ = largest_face_crop(bgr)
+            if crop is None:
+                st.error("No face detected in that photo — try again with better lighting.")
+            else:
+                st.session_state.people.setdefault(safe_name, []).append(crop)
+                st.success(f"Enrolled {safe_name}.")
+                st.rerun()
 
-st.caption("Camera access needs to be allowed in your browser. On a phone, this opens your camera app.")
+    if st.session_state.people:
+        st.divider()
+        who = st.selectbox("Remove someone", [""] + list(st.session_state.people.keys()))
+        if who and st.button(f"Remove {who}"):
+            del st.session_state.people[who]
+            st.rerun()
+
+    st.caption("⚠️ Enrolled people are remembered only for this browser session — "
+               "refreshing the page or reopening the app later starts empty.")
+
+# ---------- Main: scan for attendance ----------
+recognizer, known_names = train_recognizer()
+scan_photo = st.camera_input("Scan a face to mark attendance")
+
+if scan_photo:
+    if recognizer is None:
+        st.error("Nobody is enrolled yet — add people in the sidebar first.")
+    else:
+        img = np.array(Image.open(scan_photo).convert("RGB"))
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        boxes = detect_faces(gray)
+
+        if len(boxes) == 0:
+            st.warning("No faces detected in this photo.")
+        else:
+            marked = []
+            for (x, y, w, h) in boxes:
+                face_crop = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
+                label_id, distance = recognizer.predict(face_crop)
+                if distance <= CONFIDENCE_THRESHOLD:
+                    name, color = known_names[label_id], (0, 200, 0)
+                else:
+                    name, color = "Unknown", (0, 0, 255)
+                cv2.rectangle(bgr, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(bgr, name, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                if name != "Unknown":
+                    already = mark_present(name)
+                    marked.append(f"{name} ({'already marked today' if already else 'marked present'})")
+
+            st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption="Detected faces")
+            if marked:
+                for m in marked:
+                    st.success(m)
+            else:
+                st.info("Faces detected, but none matched an enrolled person.")
 
 st.divider()
 st.subheader("Attendance log")
